@@ -2,12 +2,13 @@ import os
 import streamlit as st
 from whoosh.index import create_in, open_dir
 from whoosh.fields import Schema, TEXT, ID
-from whoosh.qparser import QueryParser
+from whoosh.qparser import QueryParser, OrGroup, MultifieldParser
+from whoosh import highlight
 import pandas as pd
 import json
 import requests
 from bs4 import BeautifulSoup
-from PyPDF2 import PdfReader
+import fitz  # PyMuPDF
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from nltk import pos_tag, word_tokenize
@@ -32,6 +33,19 @@ else:
 stop_words = set(stopwords.words('english'))
 lemmatizer = WordNetLemmatizer()
 
+# Add custom CSS for highlighting
+st.markdown("""
+    <style>
+    .highlight {
+        color: #ff0000;
+        font-weight: bold;
+        background-color: #ffebee;
+        padding: 2px 4px;
+        border-radius: 3px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 
 def get_wordnet_pos(treebank_tag):
     if treebank_tag.startswith('J'):
@@ -50,7 +64,7 @@ def preprocess(text):
     text = text.lower()
     text = text.translate(str.maketrans('', '', string.punctuation))
     tokens = word_tokenize(text)
-    filtered_tokens = [w for w in tokens if w not in stop_words]
+    filtered_tokens = [w for w in tokens if w.isalpha() and w not in stop_words]
     pos_tags = pos_tag(filtered_tokens)
     lemmatized = [lemmatizer.lemmatize(word, get_wordnet_pos(pos)) for word, pos in pos_tags]
     return ' '.join(lemmatized).strip()
@@ -58,13 +72,25 @@ def preprocess(text):
 
 # Extraction functions
 def extract_pdf_pages(file_path):
-    reader = PdfReader(file_path)
-    return [(i + 1, page.extract_text() or "") for i, page in enumerate(reader.pages)]
+    doc = fitz.open(file_path)
+    return [(i + 1, page.get_text()) for i, page in enumerate(doc)]
 
 
 def extract_txt(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return f.read()
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            st.write(f"Successfully read TXT file: {file_path}")
+            return content
+    except UnicodeDecodeError:
+        try:
+            with open(file_path, 'r', encoding='latin1') as f:
+                content = f.read()
+                st.write(f"Read TXT file with latin1 encoding: {file_path}")
+                return content
+        except Exception as e:
+            st.error(f"Error reading text file: {e}")
+            return ""
 
 
 def extract_csv_rows(file_path):
@@ -123,6 +149,18 @@ def extract_web_content(url):
 # Streamlit Interface
 st.title("🔍 Multi-format Search Engine")
 
+# Add query help
+with st.expander("ℹ️ Search Query Help"):
+    st.markdown("""
+    **Advanced Search Syntax:**
+    - **AND**: Use space between words (e.g., `python AND data`)
+    - **OR**: Use `OR` between words (e.g., `python OR java`)
+    - **Phrase**: Use quotes (e.g., `"machine learning"`)
+    - **Wildcard**: Use `*` (e.g., `comput*` for computer, computing, etc.)
+    - **Fuzzy**: Use `~` (e.g., `roam~` for roam, foam, etc.)
+    - **Grouping**: Use parentheses (e.g., `(python OR java) AND data`)
+    """)
+
 file_types = ["PDF", "TXT", "CSV", "Excel", "JSON", "Web"]
 selected_types = st.multiselect("Select file type(s) for search", file_types, default=file_types)
 
@@ -149,7 +187,16 @@ if st.button("⚙️ Index Files"):
                     )
             elif ext == ".txt":
                 text = extract_txt(file_path)
-                writer.add_document(filename=uploaded_file.name, content=preprocess(text))
+                st.write(f"Processing TXT file: {uploaded_file.name}")
+                st.write(f"Content length: {len(text)} characters")
+                if text.strip():  # Only add if there's actual content
+                    writer.add_document(
+                        filename=uploaded_file.name,
+                        content=preprocess(text)
+                    )
+                    st.write(f"Successfully indexed TXT file: {uploaded_file.name}")
+                else:
+                    st.warning(f"TXT file is empty: {uploaded_file.name}")
             elif ext == ".csv":
                 for row_num, row_text in extract_csv_rows(file_path):
                     writer.add_document(
@@ -182,28 +229,78 @@ query = st.text_input("🔎 Enter search query here")
 if query:
     ix = open_dir(INDEX_DIR)
     with ix.searcher() as searcher:
-        parser = QueryParser("content", ix.schema)
-        parsed_query = parser.parse(preprocess(query))
+        # Configure the query parser with advanced features
+        parser = QueryParser("content", ix.schema, group=OrGroup.factory(0.9))
+        parsed_query = parser.parse(query)
+
+        # Configure highlighting
         results = searcher.search(parsed_query, limit=20)
+        results.formatter = highlight.HtmlFormatter(tagname="span", classname="highlight")
+
         st.subheader("📄 Results:")
 
         if results:
             filtered_results = []
+            # Debug information
+            st.write(f"Total results before filtering: {len(results)}")
+            st.write(f"Selected file types: {selected_types}")
+            
             for r in results:
                 filename = r['filename'].lower()
-                if any(ft.lower() in filename for ft in selected_types):
+                # Extract the base filename without the additional information
+                base_filename = filename.split(' (')[0]
+                file_ext = os.path.splitext(base_filename)[1].lower()
+                file_type = None
+                
+                if file_ext == '.pdf':
+                    file_type = 'PDF'
+                elif file_ext == '.txt':
+                    file_type = 'TXT'
+                elif file_ext == '.csv':
+                    file_type = 'CSV'
+                elif file_ext == '.xlsx':
+                    file_type = 'Excel'
+                elif file_ext == '.json':
+                    file_type = 'JSON'
+                elif filename.startswith('http'):
+                    file_type = 'Web'
+                
+                # Debug information for each file
+                st.write(f"Processing file: {filename}, Base filename: {base_filename}, Type: {file_type}")
+                
+                if file_type in selected_types:
                     filtered_results.append(r)
+
+            st.write(f"Results after filtering: {len(filtered_results)}")
 
             if not filtered_results:
                 st.warning("😕 No results match the filter criteria.")
+                # Show all results without filtering for debugging
+                st.write("Showing all results without filtering:")
+                for r in results:
+                    st.write(f"File: {r['filename']}, Score: {r.score}")
             else:
-                seen = set()
+                # Group results by filename
+                results_by_file = {}
                 for r in filtered_results:
-                    key = r['filename']
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    st.write(f"📌 **{r['filename']}** (Score: {r.score:.2f})")
-                    st.markdown(f"🔍 Snippet: {r.highlights('content')}", unsafe_allow_html=True)
+                    filename = r['filename']
+                    if filename not in results_by_file:
+                        results_by_file[filename] = []
+                    results_by_file[filename].append(r)
+
+                # Display results grouped by file
+                for filename, file_results in results_by_file.items():
+                    # Extract base filename for type detection
+                    base_filename = filename.split(' (')[0]
+                    file_ext = os.path.splitext(base_filename)[1].lower()
+                    file_type = 'Web' if filename.startswith('http') else file_ext[1:].upper()
+                    
+                    st.markdown(f"### 📄 File: {filename} ({file_type})")
+                    st.markdown(f"**Found in {len(file_results)} locations**")
+                    
+                    for r in file_results:
+                        st.markdown(f"**Score:** {r.score:.2f}")
+                        st.markdown(f"**Content:** {r.highlights('content')}", unsafe_allow_html=True)
+                        st.markdown("---")
         else:
             st.warning("😕 No matching results found.")

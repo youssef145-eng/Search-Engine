@@ -1,0 +1,12 @@
+{
+  "student": {
+    "name": "Sief",
+    "department": "CS",
+    "year": 3
+  },
+  "courses": [
+    "Information Retrieval",
+    "AI",
+    "Data Mining"
+  ]
+}
